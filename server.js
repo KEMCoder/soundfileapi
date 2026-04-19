@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execFile, execFileSync } = require('child_process');
+const { execFile } = require('child_process');
 
 // ─────────────────────────────────────────────
 //  FFmpeg Configuration
@@ -18,30 +18,20 @@ ffmpeg.setFfprobePath(ffprobePath);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// CORS
 app.use(cors());
 
 // ─────────────────────────────────────────────
 //  yt-dlp Binary Path
 // ─────────────────────────────────────────────
-// yt-dlp is downloaded during build step on Render
-// Locally on Windows, it looks for yt-dlp.exe in PATH or project root
 function getYtDlpPath() {
-    // Check project root first (Render deployment)
     const localPath = path.join(__dirname, 'yt-dlp');
     if (fs.existsSync(localPath)) return localPath;
-
-    // Windows: check for .exe
     const winPath = path.join(__dirname, 'yt-dlp.exe');
     if (fs.existsSync(winPath)) return winPath;
-
-    // Fallback to system PATH
     return 'yt-dlp';
 }
 
 const YT_DLP_PATH = getYtDlpPath();
-console.log(`yt-dlp path: ${YT_DLP_PATH}`);
 
 // ─────────────────────────────────────────────
 //  Temp Directory Management
@@ -51,21 +41,33 @@ if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
-function generateTempPath(ext) {
-    return path.join(TEMP_DIR, `${crypto.randomUUID()}.${ext}`);
+function generateId() {
+    return crypto.randomUUID();
 }
 
 function cleanup(...files) {
     for (const file of files) {
         try {
-            if (fs.existsSync(file)) fs.unlinkSync(file);
+            if (file && fs.existsSync(file)) fs.unlinkSync(file);
         } catch (err) {
             console.warn('Cleanup error:', err.message);
         }
     }
 }
 
-// Periodically clean old temp files (older than 10 minutes)
+// Clean files matching a pattern (for yt-dlp which may create multiple files)
+function cleanupPattern(baseName) {
+    try {
+        const files = fs.readdirSync(TEMP_DIR);
+        for (const file of files) {
+            if (file.startsWith(baseName)) {
+                try { fs.unlinkSync(path.join(TEMP_DIR, file)); } catch {}
+            }
+        }
+    } catch {}
+}
+
+// Periodically clean old temp files
 setInterval(() => {
     try {
         const files = fs.readdirSync(TEMP_DIR);
@@ -81,108 +83,83 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ─────────────────────────────────────────────
-//  URL Detection Helpers
+//  URL Detection
 // ─────────────────────────────────────────────
-function isYouTube(url) {
-    return /youtube\.com|youtu\.be|music\.youtube\.com/i.test(url);
-}
-
-function isInstagram(url) {
-    return /instagram\.com/i.test(url);
-}
-
 function isSupportedBySite(url) {
-    // URLs that yt-dlp can handle (video/social media platforms)
-    return isYouTube(url) || isInstagram(url) ||
-        /tiktok\.com|twitter\.com|x\.com|soundcloud\.com|dailymotion\.com|vimeo\.com|twitch\.tv|facebook\.com/i.test(url);
+    return /youtube\.com|youtu\.be|music\.youtube\.com|instagram\.com|tiktok\.com|twitter\.com|x\.com|soundcloud\.com|dailymotion\.com|vimeo\.com|twitch\.tv|facebook\.com/i.test(url);
 }
 
 // ─────────────────────────────────────────────
-//  Download Functions
+//  Download with yt-dlp
+//  Downloads audio and returns the actual file path
 // ─────────────────────────────────────────────
-
-// Download using yt-dlp (YouTube, Instagram, TikTok, etc.)
-function downloadWithYtDlp(url, outputPath) {
+function downloadWithYtDlp(url, jobId) {
     return new Promise((resolve, reject) => {
+        // Use %(ext)s so yt-dlp controls the extension
+        const outputTemplate = path.join(TEMP_DIR, `${jobId}.%(ext)s`);
+
         const args = [
             '--no-check-certificates',
-            '--no-playlist',           // Single video only
-            '-x',                       // Extract audio
-            '--audio-format', 'wav',    // Convert to WAV
-            '--audio-quality', '0',     // Best quality
-            '-o', outputPath,           // Output path
+            '--no-playlist',
+            '-f', 'bestaudio/best',         // Download best audio stream directly
+            '--ffmpeg-location', path.dirname(ffmpegPath), // Tell yt-dlp where ffmpeg is
+            '-o', outputTemplate,
             '--no-warnings',
-            '--prefer-free-formats',
+            '--no-simulate',
+            '--print', 'after_move:filepath', // Print the actual output file path
             url
         ];
 
         console.log(`📥 yt-dlp downloading: ${url}`);
+        console.log(`   args: ${args.join(' ')}`);
 
         execFile(YT_DLP_PATH, args, {
-            timeout: 120000, // 2 minute timeout
-            maxBuffer: 10 * 1024 * 1024
+            timeout: 180000, // 3 minute timeout
+            maxBuffer: 50 * 1024 * 1024
         }, (error, stdout, stderr) => {
             if (error) {
                 console.error('yt-dlp error:', error.message);
-                console.error('yt-dlp stderr:', stderr);
-                return reject(new Error(`yt-dlp failed: ${error.message}`));
+                if (stderr) console.error('yt-dlp stderr:', stderr);
+                return reject(new Error(`yt-dlp failed: ${stderr || error.message}`));
             }
 
-            console.log('yt-dlp stdout:', stdout);
+            if (stdout) console.log('yt-dlp stdout:', stdout.trim());
+            if (stderr) console.log('yt-dlp stderr:', stderr.trim());
 
-            // yt-dlp might change the extension, find the actual file
-            const dir = path.dirname(outputPath);
-            const baseName = path.basename(outputPath, path.extname(outputPath));
-
-            // Look for the output file (yt-dlp may add different extension)
-            const possibleExts = ['.wav', '.opus', '.webm', '.m4a', '.mp3', '.ogg'];
-            let foundFile = null;
-
-            if (fs.existsSync(outputPath)) {
-                foundFile = outputPath;
-            } else {
-                for (const ext of possibleExts) {
-                    const tryPath = path.join(dir, baseName + ext);
-                    if (fs.existsSync(tryPath)) {
-                        foundFile = tryPath;
-                        break;
-                    }
-                }
+            // Method 1: Use the printed filepath from --print
+            const printedPath = stdout.trim().split('\n').filter(l => l.trim()).pop();
+            if (printedPath && fs.existsSync(printedPath)) {
+                const size = fs.statSync(printedPath).size;
+                console.log(`   ✅ Found via --print: ${printedPath} (${(size / 1024 / 1024).toFixed(2)} MB)`);
+                return resolve(printedPath);
             }
 
-            if (!foundFile) {
-                // Try to find any recently created file in temp dir
-                const files = fs.readdirSync(dir)
-                    .filter(f => f.startsWith(baseName))
-                    .map(f => path.join(dir, f));
+            // Method 2: Scan temp dir for files matching our jobId
+            const files = fs.readdirSync(TEMP_DIR)
+                .filter(f => f.startsWith(jobId))
+                .map(f => path.join(TEMP_DIR, f))
+                .filter(f => {
+                    try { return fs.statSync(f).size > 0; }
+                    catch { return false; }
+                });
 
-                if (files.length > 0) {
-                    foundFile = files[0];
-                }
+            if (files.length > 0) {
+                // Pick the largest file (most likely the actual audio)
+                files.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
+                const found = files[0];
+                const size = fs.statSync(found).size;
+                console.log(`   ✅ Found via scan: ${found} (${(size / 1024 / 1024).toFixed(2)} MB)`);
+                return resolve(found);
             }
 
-            if (!foundFile || !fs.existsSync(foundFile)) {
-                return reject(new Error('yt-dlp completed but output file not found'));
-            }
-
-            // If the found file isn't the expected path, rename it
-            if (foundFile !== outputPath) {
-                try {
-                    fs.renameSync(foundFile, outputPath);
-                } catch {
-                    // If rename fails, copy instead
-                    fs.copyFileSync(foundFile, outputPath);
-                    try { fs.unlinkSync(foundFile); } catch {}
-                }
-            }
-
-            console.log(`   ✅ yt-dlp download complete`);
-            resolve();
+            reject(new Error('yt-dlp completed but no output file found'));
         });
     });
 }
 
-// Download a file from a direct URL
+// ─────────────────────────────────────────────
+//  Direct Download
+// ─────────────────────────────────────────────
 async function downloadFile(url, outputPath) {
     console.log(`📥 Direct downloading: ${url}`);
 
@@ -202,80 +179,64 @@ async function downloadFile(url, outputPath) {
 
     return new Promise((resolve, reject) => {
         writer.on('finish', () => {
-            console.log(`   ✅ Direct download complete`);
-            resolve();
+            const size = fs.statSync(outputPath).size;
+            console.log(`   ✅ Downloaded: ${(size / 1024 / 1024).toFixed(2)} MB`);
+            resolve(outputPath);
         });
         writer.on('error', reject);
         response.data.on('error', reject);
     });
 }
 
-// Smart download - picks the right method based on URL
-async function smartDownload(url, outputPath) {
+// ─────────────────────────────────────────────
+//  Smart Download
+// ─────────────────────────────────────────────
+async function smartDownload(url, jobId) {
     if (isSupportedBySite(url)) {
-        // Use yt-dlp for video/social platforms
         try {
-            await downloadWithYtDlp(url, outputPath);
-            return;
+            return await downloadWithYtDlp(url, jobId);
         } catch (err) {
-            console.warn(`⚠️ yt-dlp failed, trying direct download: ${err.message}`);
-            // Fall through to direct download
+            console.warn(`⚠️ yt-dlp failed: ${err.message}`);
+            console.warn('   Falling back to direct download...');
         }
     }
 
-    // Direct download for regular URLs
+    // Direct download fallback
+    const outputPath = path.join(TEMP_DIR, `${jobId}.input`);
     await downloadFile(url, outputPath);
-
-    // Verify file was downloaded
-    if (!fs.existsSync(outputPath)) {
-        throw new Error('Download failed - no file created');
-    }
-
-    const stats = fs.statSync(outputPath);
-    if (stats.size === 0) {
-        throw new Error('Download failed - empty file');
-    }
-
-    console.log(`   📦 File size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+    return outputPath;
 }
 
 // ─────────────────────────────────────────────
 //  FFmpeg Conversion
 // ─────────────────────────────────────────────
-
-// Convert any audio/video file to WAV format
-function convertToWav(inputPath, outputPath, options = {}) {
+function convertToWav(inputPath, outputPath) {
     return new Promise((resolve, reject) => {
-        const command = ffmpeg(inputPath)
-            .audioChannels(options.channels || 2)
-            .audioFrequency(options.sampleRate || 44100)
+        console.log(`🔄 Converting to WAV: ${path.basename(inputPath)}`);
+
+        ffmpeg(inputPath)
+            .audioChannels(2)
+            .audioFrequency(44100)
             .audioCodec('pcm_s16le')
-            .format('wav');
-
-        command.on('start', (cmd) => {
-            console.log(`🔄 FFmpeg converting...`);
-        });
-
-        command.on('end', () => {
-            console.log('   ✅ Conversion complete');
-            resolve();
-        });
-
-        command.on('error', (err) => {
-            console.error('   ❌ FFmpeg error:', err.message);
-            reject(err);
-        });
-
-        command.save(outputPath);
+            .format('wav')
+            .on('start', () => console.log('   FFmpeg started...'))
+            .on('end', () => {
+                const size = fs.statSync(outputPath).size;
+                console.log(`   ✅ WAV ready: ${(size / 1024 / 1024).toFixed(2)} MB`);
+                resolve();
+            })
+            .on('error', (err) => {
+                console.error(`   ❌ FFmpeg error: ${err.message}`);
+                reject(err);
+            })
+            .save(outputPath);
     });
 }
 
-// Get metadata from an audio/video file
 function getMetadata(filePath) {
     return new Promise((resolve, reject) => {
         ffmpeg.ffprobe(filePath, (err, metadata) => {
             if (err) return reject(err);
-
             const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
             resolve({
                 duration: parseFloat(metadata.format.duration) || 0,
@@ -292,92 +253,81 @@ function getMetadata(filePath) {
 //  API ENDPOINTS
 // ─────────────────────────────────────────────
 
-// Health check
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
         message: 'Velo Audio Server is running',
-        version: '1.1.0',
-        endpoints: {
-            '/api/audio/convert': 'Convert audio file to WAV (returns raw binary)',
-            '/api/video/audio': 'Extract audio from video (returns JSON with base64)',
-            '/api/audio/info': 'Get audio file metadata'
-        }
+        version: '1.2.0'
     });
 });
 
-// ─────────────────────────────────────────────
-//  GET /api/audio/convert
-//  Returns: Raw WAV binary data
-// ─────────────────────────────────────────────
+// GET /api/audio/convert → Raw WAV binary
 app.get('/api/audio/convert', async (req, res) => {
-    const { url, audioFormat } = req.query;
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ success: false, error: 'URL parameter is required.' });
 
-    if (!url) {
-        return res.status(400).json({
-            success: false,
-            error: 'URL parameter is required.'
-        });
-    }
+    const jobId = generateId();
+    const wavPath = path.join(TEMP_DIR, `${jobId}.wav`);
+    let downloadedPath = null;
 
     console.log(`\n${'═'.repeat(50)}`);
-    console.log(`🎵 Audio Convert Request`);
+    console.log(`🎵 Audio Convert | Job: ${jobId}`);
     console.log(`   URL: ${url}`);
     console.log(`${'═'.repeat(50)}`);
 
-    const inputPath = generateTempPath('input');
-    const outputPath = generateTempPath('wav');
-
     try {
-        await smartDownload(url, inputPath);
-        await convertToWav(inputPath, outputPath);
+        // Download
+        downloadedPath = await smartDownload(url, jobId);
 
-        const wavBuffer = fs.readFileSync(outputPath);
-        console.log(`📤 Sending WAV: ${(wavBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+        // Convert to WAV
+        await convertToWav(downloadedPath, wavPath);
+
+        // Send
+        const wavBuffer = fs.readFileSync(wavPath);
+        console.log(`📤 Sending WAV: ${(wavBuffer.length / 1024 / 1024).toFixed(2)} MB\n`);
 
         res.set('Content-Type', 'audio/wav');
         res.set('Content-Length', wavBuffer.length);
         res.send(wavBuffer);
 
     } catch (err) {
-        console.error('❌ Audio convert error:', err.message);
+        console.error(`❌ Error: ${err.message}\n`);
         res.status(500).json({ success: false, error: err.message });
     } finally {
-        cleanup(inputPath, outputPath);
+        cleanup(downloadedPath, wavPath);
+        cleanupPattern(jobId);
     }
 });
 
-// ─────────────────────────────────────────────
-//  GET /api/video/audio
-//  Returns: JSON { success, audioData (base64), metadata }
-// ─────────────────────────────────────────────
+// GET /api/video/audio → JSON { success, audioData (base64), metadata }
 app.get('/api/video/audio', async (req, res) => {
-    const { url, audioFormat } = req.query;
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ success: false, error: 'URL parameter is required.' });
 
-    if (!url) {
-        return res.status(400).json({
-            success: false,
-            error: 'URL parameter is required.'
-        });
-    }
+    const jobId = generateId();
+    const wavPath = path.join(TEMP_DIR, `${jobId}.wav`);
+    let downloadedPath = null;
 
     console.log(`\n${'═'.repeat(50)}`);
-    console.log(`🎬 Video Audio Extract Request`);
+    console.log(`🎬 Video Audio Extract | Job: ${jobId}`);
     console.log(`   URL: ${url}`);
     console.log(`${'═'.repeat(50)}`);
 
-    const inputPath = generateTempPath('input');
-    const outputPath = generateTempPath('wav');
-
     try {
-        await smartDownload(url, inputPath);
-        await convertToWav(inputPath, outputPath);
+        // Download
+        downloadedPath = await smartDownload(url, jobId);
 
-        const metadata = await getMetadata(outputPath);
-        const wavBuffer = fs.readFileSync(outputPath);
+        // Convert to WAV
+        await convertToWav(downloadedPath, wavPath);
+
+        // Metadata
+        const metadata = await getMetadata(wavPath);
+
+        // Base64 encode
+        const wavBuffer = fs.readFileSync(wavPath);
         const base64Data = wavBuffer.toString('base64');
 
-        console.log(`📤 Sending base64 audio: ${(wavBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+        console.log(`📤 Sending base64: ${(wavBuffer.length / 1024 / 1024).toFixed(2)} MB\n`);
 
         res.json({
             success: true,
@@ -393,33 +343,31 @@ app.get('/api/video/audio', async (req, res) => {
         });
 
     } catch (err) {
-        console.error('❌ Video audio extract error:', err.message);
+        console.error(`❌ Error: ${err.message}\n`);
         res.status(500).json({ success: false, error: err.message });
     } finally {
-        cleanup(inputPath, outputPath);
+        cleanup(downloadedPath, wavPath);
+        cleanupPattern(jobId);
     }
 });
 
-// ─────────────────────────────────────────────
-//  GET /api/audio/info
-// ─────────────────────────────────────────────
+// GET /api/audio/info → metadata
 app.get('/api/audio/info', async (req, res) => {
     const { url } = req.query;
+    if (!url) return res.status(400).json({ success: false, error: 'URL parameter is required.' });
 
-    if (!url) {
-        return res.status(400).json({ success: false, error: 'URL parameter is required.' });
-    }
-
-    const inputPath = generateTempPath('input');
+    const jobId = generateId();
+    let downloadedPath = null;
 
     try {
-        await smartDownload(url, inputPath);
-        const metadata = await getMetadata(inputPath);
+        downloadedPath = await smartDownload(url, jobId);
+        const metadata = await getMetadata(downloadedPath);
         res.json({ success: true, metadata });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     } finally {
-        cleanup(inputPath);
+        cleanup(downloadedPath);
+        cleanupPattern(jobId);
     }
 });
 
@@ -429,28 +377,25 @@ app.use((err, req, res, next) => {
     res.status(500).json({ success: false, error: 'Internal server error' });
 });
 
-// 404
 app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        error: `Endpoint not found: ${req.method} ${req.path}`
-    });
+    res.status(404).json({ success: false, error: `Not found: ${req.method} ${req.path}` });
 });
 
 // ─────────────────────────────────────────────
-//  Start Server
+//  Start
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════╗');
-    console.log('║   Velo Audio Server v1.1                ║');
-    console.log(`║   Running on port ${PORT}                  ║`);
-    console.log('║   Ready to accept requests              ║');
+    console.log('║   Velo Audio Server v1.2                ║');
+    console.log(`║   Port: ${PORT}                             ║`);
     console.log('╠══════════════════════════════════════════╣');
-    console.log('║   Endpoints:                            ║');
-    console.log('║   • /api/audio/convert  (URL → WAV)     ║');
-    console.log('║   • /api/video/audio   (Video → Audio)  ║');
-    console.log('║   • /api/audio/info    (Get metadata)   ║');
+    console.log('║   /api/audio/convert  (URL → WAV)       ║');
+    console.log('║   /api/video/audio    (Video → Audio)   ║');
+    console.log('║   /api/audio/info     (Metadata)        ║');
+    console.log('║   GÜNCEL SİSTEM V2                      ║');
     console.log('╚══════════════════════════════════════════╝');
+    console.log(`   ffmpeg: ${ffmpegPath}`);
+    console.log(`   yt-dlp: ${YT_DLP_PATH}`);
     console.log('');
 });
